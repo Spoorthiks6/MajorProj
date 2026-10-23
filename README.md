@@ -27,3 +27,18 @@ To use Groq, copy `.env.example` to `.env` and replace the placeholder with your
 file is ignored by Git and should be copied securely (not committed) to each
 machine where you run the project. Alternatively, set `GROQ_API_KEY` in the
 environment. Without a key, the pipeline uses a local coaching template.
+
+After running the pipeline, start the live dashboard chat:
+
+```bash
+python3 src/09_dashboard_server.py
+```
+
+Open [http://localhost:8765/](http://localhost:8765/) in your browser and keep
+the server terminal running while chatting. The dashboard includes an ongoing
+conversation, perspective selector (student, teacher, parent, coach, or
+overall), and a new-conversation button. The live chat requires
+`GROQ_API_KEY`; questions and session metrics are sent to Groq by the local
+server, which keeps the key out of the browser. Stop the server with Ctrl+C.
+Do not open `reports/index.html` directly for chat; that is a static file and
+cannot reach the live feedback server.

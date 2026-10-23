@@ -179,27 +179,114 @@ def generate_html_report(summary_df: pd.DataFrame) -> None:
         index=False, classes="summary-table", border=0, justify="left",
     )
 
-    session_notes_path = REPORTS_DIR / "llm_session_summary.txt"
-    dashboard_notes_path = REPORTS_DIR / "llm_dashboard_insights.txt"
+    chat_widget = """<div class="card"><h2>Interactive study feedback</h2>
+<p>Ask questions about your recorded sessions and continue the conversation. Feedback uses experimental estimates, not validated assessments.</p>
+<div class="chat-controls">
+<label for="feedback-role">Feedback perspective</label>
+<select id="feedback-role">
+<option value="student">Student</option><option value="teacher">Teacher</option>
+<option value="parent">Parent</option><option value="coach">Study coach</option>
+<option value="overall">Overall</option></select>
+<button id="clear-chat" type="button">New conversation</button></div>
+<div id="chat-messages" class="chat-messages" role="log" aria-live="polite">
+<div class="chat-message assistant">Hi! Ask me about your sessions, activities, or practical next steps.</div>
+</div>
+<form id="chat-form">
+<label class="visually-hidden" for="chat-input">Your question</label>
+<textarea id="chat-input" rows="2" maxlength="1500" required
+placeholder="Ask a question about your sessions..."></textarea>
+<button id="send-message" type="submit">Send</button></form>
+<p id="chat-status" class="chat-status" aria-live="polite">Checking the local feedback service...</p>
+</div>
+<script>
+(() => {
+  const form = document.getElementById("chat-form");
+  const input = document.getElementById("chat-input");
+  const roleSelect = document.getElementById("feedback-role");
+  const messagesElement = document.getElementById("chat-messages");
+  const statusElement = document.getElementById("chat-status");
+  const sendButton = document.getElementById("send-message");
+  let history = [];
 
-    if session_notes_path.exists():
-        session_blocks = [
-            (
-                f"<div class='note-block'><strong>{escape(block.partition(chr(10))[0])}</strong>"
-                f"<br>{escape(block.partition(chr(10))[2])}</div>"
-            )
-            for block in session_notes_path.read_text(encoding="utf-8").split("\n\n")
-            if block.strip()
-        ]
-        session_notes_html = "".join(session_blocks)
-    else:
-        session_notes_html = "<p>No session-level coaching notes available yet.</p>"
+  if (window.location.protocol === "file:") {
+    statusElement.textContent = "This page was opened as a file. Start the dashboard server and open http://localhost:8765/ to use live chat.";
+    input.disabled = true;
+    sendButton.disabled = true;
+  } else if (!["localhost", "127.0.0.1"].includes(window.location.hostname)) {
+    statusElement.textContent = "Open this dashboard at http://localhost:8765/ to use live chat.";
+    input.disabled = true;
+    sendButton.disabled = true;
+  } else {
+    statusElement.textContent = "Live chat is ready. Ask a question to begin.";
+  }
 
-    if dashboard_notes_path.exists():
-        dashboard_note_text = escape(dashboard_notes_path.read_text(encoding="utf-8").strip())
-        dashboard_notes_html = f"<div class='note-block'>{dashboard_note_text.replace(chr(10), '<br>')}</div>"
-    else:
-        dashboard_notes_html = "<p>No dashboard-level insight available yet.</p>"
+  function addMessage(role, text) {
+    const message = document.createElement("div");
+    message.className = `chat-message ${role}`;
+    message.textContent = text;
+    messagesElement.appendChild(message);
+    messagesElement.scrollTop = messagesElement.scrollHeight;
+    return message;
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const question = input.value.trim();
+    if (!question || sendButton.disabled) return;
+
+    const previousHistory = history.slice();
+    history = history.slice(-11);
+    history.push({role: "user", content: question});
+    addMessage("user", question);
+    input.value = "";
+    input.disabled = true;
+    sendButton.disabled = true;
+    statusElement.textContent = "Thinking...";
+    const pending = addMessage("assistant", "Thinking...");
+
+    try {
+      const response = await fetch("/api/chat", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({role: roleSelect.value, messages: history})
+      });
+      let result;
+      try {
+        result = await response.json();
+      } catch {
+        throw new Error("The local feedback server returned an invalid response.");
+      }
+      if (!response.ok) throw new Error(result.error || "Feedback request failed.");
+      if (typeof result.answer !== "string" || !result.answer.trim()) {
+        throw new Error("The feedback service returned an empty answer. Please try again.");
+      }
+      pending.textContent = result.answer;
+      history.push({role: "assistant", content: result.answer});
+      history = history.slice(-12);
+      statusElement.textContent = "Ready for your next question.";
+    } catch (error) {
+      pending.remove();
+      history = previousHistory;
+      input.value = question;
+      statusElement.textContent = error instanceof TypeError
+        ? "Can't reach the local feedback server. Start `python3 src/09_dashboard_server.py` and open http://localhost:8765/."
+        : error.message;
+    } finally {
+      input.disabled = false;
+      sendButton.disabled = false;
+      input.focus();
+    }
+  });
+
+  document.getElementById("clear-chat").addEventListener("click", () => {
+    history = [];
+    messagesElement.replaceChildren();
+    addMessage("assistant", "New conversation started. What would you like to know?");
+    statusElement.textContent = "Conversation cleared.";
+    input.focus();
+  });
+})();
+</script>"""
 
     html = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>NeuroStudy AI Dashboard</title>
@@ -211,15 +298,26 @@ table.summary-table {{ width: 100%; border-collapse: collapse; margin-top: 12px;
 table.summary-table th, table.summary-table td {{ padding: 8px 10px; border-bottom: 1px solid #e1e5eb; text-align: left; }}
 table.summary-table th {{ background: #f1f4fb; color: #1b2b5f; }}
 img.dashboard-image {{ width: 100%; max-width: 1200px; border-radius: 12px; margin-top: 16px; }}
-.note-block {{ background: #f7f9fd; border-left: 4px solid #3b82f6; padding: 12px 14px; margin-top: 10px; border-radius: 8px; line-height: 1.5; }}
+.chat-controls, #chat-form {{ display: flex; gap: 10px; align-items: center; margin: 12px 0; }}
+.chat-controls select, #chat-input {{ border: 1px solid #ccd3df; border-radius: 8px; padding: 10px; font: inherit; }}
+.chat-controls button, #send-message {{ border: 0; border-radius: 8px; padding: 10px 16px; background: #2b3b69; color: white; font: inherit; cursor: pointer; }}
+.chat-controls button {{ margin-left: auto; background: #64748b; }}
+#chat-form {{ align-items: stretch; }}
+#chat-input {{ flex: 1; resize: vertical; min-width: 0; }}
+.chat-messages {{ height: 320px; overflow-y: auto; background: #f7f9fd; border: 1px solid #e1e5eb; border-radius: 10px; padding: 12px; }}
+.chat-message {{ max-width: 85%; padding: 10px 12px; margin: 8px 0; border-radius: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }}
+.chat-message.assistant {{ background: white; border: 1px solid #e1e5eb; }}
+.chat-message.user {{ margin-left: auto; background: #e7efff; }}
+.chat-status {{ color: #526079; min-height: 1.2em; }}
+.visually-hidden {{ position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }}
+@media (max-width: 600px) {{ body {{ margin: 12px; }} .chat-controls {{ flex-wrap: wrap; }} .chat-controls button {{ margin-left: 0; }} }}
 </style></head><body>
 <div class="card"><h1>NeuroStudy AI Dashboard</h1>
-<p>Live session summary and dashboard report generated from your cleaned EEG data.</p></div>
+<p>Session summary and dashboard report generated from your cleaned EEG data.</p></div>
 <div class="card"><h2>Dashboard Image</h2>
 <img class="dashboard-image" src="dashboard_summary.png" alt="Dashboard summary" /></div>
 <div class="card"><h2>Top Sessions by Duration</h2>{top_sessions_html}</div>
-<div class="card"><h2>Session-by-session coaching notes</h2>{session_notes_html}</div>
-<div class="card"><h2>Dashboard-level insight</h2>{dashboard_notes_html}</div>
+{chat_widget}
 </body></html>"""
     (REPORTS_DIR / "index.html").write_text(html, encoding="utf-8")
 

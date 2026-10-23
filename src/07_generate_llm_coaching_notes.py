@@ -93,7 +93,7 @@ def _repair_note(text: str, fallback: str) -> str:
     else:
         return cleaned
 
-    print(f"Groq response rejected ({reason}); using the template fallback.")
+    print(f"Groq response rejected ({reason}); using local template feedback, not an LLM response.")
     return fallback
 
 
@@ -107,7 +107,6 @@ def _call_llm(
     import requests
     import time
 
-    failure_reason = "rate limit"
     for attempt in range(max_retries):
         response = requests.post(
             GROQ_URL,
@@ -122,31 +121,41 @@ def _call_llm(
                 "temperature": 0.2,
                 "top_p": 0.9,
             },
+            timeout=45,
         )
-        result = response.json()
 
         if response.status_code == 429:
-            wait_s = 16  # Groq free tier resets per-minute; a bit over 15s to be safe
-            print(f"  Rate limited — waiting {wait_s}s before retry ({attempt + 1}/{max_retries})...")
-            time.sleep(wait_s)
+            if attempt + 1 < max_retries:
+                wait_s = 16  # Groq free tier resets per-minute; a bit over 15s to be safe
+                print(f"  Rate limited — waiting {wait_s}s before retry ({attempt + 1}/{max_retries})...")
+                time.sleep(wait_s)
             continue
 
-        if "choices" not in result:
-            raise RuntimeError(f"Groq API error (status {response.status_code}): {result}")
+        response.raise_for_status()
+        try:
+            result = response.json()
+        except ValueError as error:
+            raise RuntimeError("Groq returned an invalid JSON response.") from error
 
-        text = (result["choices"][0]["message"].get("content") or "").strip()
+        if not isinstance(result, dict):
+            raise RuntimeError("Groq returned a response in an unexpected format.")
+        choices = result.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise RuntimeError("Groq returned no completion choices.")
+
+        message = choices[0].get("message")
+        text = message.get("content") if isinstance(message, dict) else None
+        text = text.strip() if isinstance(text, str) else ""
         if not text:
-            failure_reason = "empty response"
             if attempt + 1 < max_retries:
                 print(f"  Groq returned an empty response — retrying ({attempt + 1}/{max_retries})...")
             continue
         return _trim_to_complete_sentence(text)
 
-    if failure_reason == "rate limit":
-        raise RuntimeError(
-            "Groq API still rate-limited after retries — wait a minute and re-run this script."
-        )
-    raise RuntimeError(f"Groq returned an empty response after {max_retries} attempts.")
+    raise RuntimeError(
+        f"Groq returned no usable response after {max_retries} attempts "
+        "(empty response or rate limit)."
+    )
 
 
 # Build a plain-language summary when no LLM response is available for a session.
@@ -165,6 +174,27 @@ def fallback_session_text(row: pd.Series) -> str:
         f"{row['tomorrow_suggested_duration_min']}-minute next-session duration "
         "as rough suggestions, not validated targets."
     )
+
+
+def _generate_note(
+    client: str,
+    prompt: str,
+    fallback: str,
+    system_prompt: str = SYSTEM_PROMPT,
+) -> tuple[str, bool]:
+    import requests
+
+    try:
+        response_text = _call_llm(client, prompt, system_prompt=system_prompt)
+    except (requests.RequestException, RuntimeError) as error:
+        print(
+            f"Groq feedback unavailable ({error}); using local template feedback, "
+            "not an LLM response."
+        )
+        return fallback, True
+
+    note = _repair_note(response_text, fallback)
+    return note, note == fallback
 
 
 # Generate per-session coaching notes and a summary insight from the session metrics.
@@ -188,11 +218,13 @@ def generate_narratives(summary_df: pd.DataFrame):
                 "suggestions only on these metrics, and describe heuristic "
                 "values as estimates rather than validated measurements."
             )
-            text = _repair_note(_call_llm(client, prompt), fallback)
+            text, used_fallback = _generate_note(client, prompt, fallback)
             time.sleep(2)  # spread out calls to stay under free-tier tokens-per-minute limit
         else:
             text = fallback
-        session_lines.append(f"{person} — {activity}\n{text}")
+            used_fallback = True
+        source = "template fallback" if used_fallback else "LLM-generated"
+        session_lines.append(f"{person} — {activity} [{source}]\n{text}")
 
     if client:
         summary_cols = ["activity", "duration_min", "mental_fatigue",
@@ -204,28 +236,33 @@ def generate_narratives(summary_df: pd.DataFrame):
               "which activities were associated with higher focus/retention "
               "and what the student should try next."
         )
-        dashboard_text = _repair_note(
-            _call_llm(
-                client,
-                dashboard_prompt,
-                system_prompt=DASHBOARD_SYSTEM_PROMPT,
-            ),
-            (
-                f"Across {len(summary_df)} sessions, '{summary_df.sort_values('predicted_retention_pct', ascending=False).iloc[0]['activity']}' "
-                f"showed the highest predicted retention ({summary_df.sort_values('predicted_retention_pct', ascending=False).iloc[0]['predicted_retention_pct']:.0f}%), while "
-                f"'{summary_df.sort_values('predicted_retention_pct').iloc[0]['activity']}' showed the lowest ({summary_df.sort_values('predicted_retention_pct').iloc[0]['predicted_retention_pct']:.0f}%). "
-                "(Set GROQ_API_KEY for a richer LLM-generated summary.)"
-            )
+        highest = summary_df.sort_values("predicted_retention_pct", ascending=False).iloc[0]
+        lowest = summary_df.sort_values("predicted_retention_pct").iloc[0]
+        dashboard_fallback = (
+            f"Across {len(summary_df)} sessions, '{highest['activity']}' showed the highest "
+            f"estimated retention ({highest['predicted_retention_pct']:.0f}%), while "
+            f"'{lowest['activity']}' showed the lowest "
+            f"({lowest['predicted_retention_pct']:.0f}%). "
+            "This is a local heuristic summary, not an LLM response."
         )
+        dashboard_text, used_fallback = _generate_note(
+            client,
+            dashboard_prompt,
+            dashboard_fallback,
+            system_prompt=DASHBOARD_SYSTEM_PROMPT,
+        )
+        source = "Template fallback (not LLM-generated)" if used_fallback else "LLM-generated"
+        dashboard_text = f"{source}: {dashboard_text}"
     else:
         top = summary_df.sort_values("predicted_retention_pct", ascending=False).iloc[0]
         low = summary_df.sort_values("predicted_retention_pct").iloc[0]
         dashboard_text = (
             f"Across {len(summary_df)} sessions, '{top['activity']}' showed the highest "
-            f"predicted retention ({top['predicted_retention_pct']:.0f}%), while "
+            f"estimated retention ({top['predicted_retention_pct']:.0f}%), while "
             f"'{low['activity']}' showed the lowest ({low['predicted_retention_pct']:.0f}%). "
-            "(Set GROQ_API_KEY for a richer LLM-generated summary.)"
+            "This is a local heuristic summary, not an LLM response."
         )
+        dashboard_text = f"Template fallback (not LLM-generated): {dashboard_text}"
 
     return "\n\n".join(session_lines), dashboard_text
 
